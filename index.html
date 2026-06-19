@@ -1161,15 +1161,77 @@ document.querySelectorAll('.proj-card').forEach(card=>{
     var holograms = buildHolograms();
     holograms.forEach(function(h) { scene.add(h); });
 
-    /* Render loop */
+    /* ── NEON TRAIL SYSTEM (used during exit orbit) ──────── */
+    var TRAIL_MAX  = 180;
+    var trailBuf   = [];        // ring buffer of {x,z,age,alt}
+    var trailPArr  = new Float32Array(TRAIL_MAX * 3);
+    var trailCArr  = new Float32Array(TRAIL_MAX * 3);
+    var trailGeo   = new THREE.BufferGeometry();
+    trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPArr, 3));
+    trailGeo.setAttribute('color',    new THREE.BufferAttribute(trailCArr, 3));
+    trailGeo.setDrawRange(0, 0);
+    var trailPts   = new THREE.Points(trailGeo, new THREE.PointsMaterial({
+      size: 0.26, vertexColors: true, transparent: true, opacity: 1,
+      blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true
+    }));
+    scene.add(trailPts);
+
+    /* Trail update — called every frame during orbit & final pass */
+    function pushTrail(x, z, alt) {
+      trailBuf.unshift({ x: x, z: z, age: 0, alt: alt });
+      if (trailBuf.length > TRAIL_MAX) trailBuf.pop();
+
+      var count = trailBuf.length;
+      trailBuf.forEach(function(p, i) {
+        p.age += 0.016;
+        var life = Math.max(0, 1 - p.age / 3);      // 3-second lifetime
+        trailPArr[i*3]   = p.x;
+        trailPArr[i*3+1] = 0.14;
+        trailPArr[i*3+2] = p.z;
+        if (!p.alt) {
+          trailCArr[i*3] = 0;    trailCArr[i*3+1] = 0.83 * life; trailCArr[i*3+2] = life;
+        } else {
+          trailCArr[i*3] = 0.49 * life; trailCArr[i*3+1] = 0.23 * life; trailCArr[i*3+2] = 0.93 * life;
+        }
+      });
+      trailGeo.attributes.position.needsUpdate = true;
+      trailGeo.attributes.color.needsUpdate    = true;
+      trailGeo.setDrawRange(0, count);
+    }
+
+    /* ── EXIT SEQUENCE STATE ─────────────────────────────── */
+    var exit = {
+      started:     false,
+      orbitOn:     false,
+      orbitAngle:  0,
+      orbitRadius: 9,
+      orbitSpeed:  (Math.PI * 2) / 2.5,   // one lap in 2.5 s
+      followCam:   false,
+      lastT:       0,
+      passOn:      false,
+      passProxy:   null,
+      passStart:   null,
+      trailAlt:    false,
+      flashed:     false
+    };
+
+    /* Full-screen blue flash div */
+    var flashDiv = document.createElement('div');
+    flashDiv.style.cssText =
+      'position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:0;' +
+      'background:radial-gradient(ellipse at 50% 55%,' +
+        'rgba(0,210,255,1) 0%,rgba(0,120,230,0.78) 30%,' +
+        'rgba(0,40,120,0.45) 60%,transparent 90%)';
+    document.body.appendChild(flashDiv);
+
+    /* ── RENDER LOOP ─────────────────────────────────────── */
     var rafId;
-    var clock     = new THREE.Clock();
-    var smokeOn   = false;
-    var sparksOn  = false;
+    var clock   = new THREE.Clock();
+    var smokeOn = false, sparksOn = false;
 
     function tick() {
       rafId = requestAnimationFrame(tick);
-      var t = clock.getElapsedTime();
+      var t  = clock.getElapsedTime();
 
       tickParticles(ambPts, t);
       if (smokeOn)  tickSmoke(smoke, t);
@@ -1183,6 +1245,53 @@ document.querySelectorAll('.proj-card').forEach(card=>{
           h.position.y = h._baseY + Math.sin(t * 0.72 + i * 1.4) * 0.09;
         }
       });
+
+      /* ── EXIT ORBIT ── */
+      if (exit.orbitOn) {
+        var dt    = Math.min(t - exit.lastT, 0.05); // cap spike frames
+        exit.lastT = t;
+        exit.orbitAngle += exit.orbitSpeed * dt;
+
+        var a = exit.orbitAngle;
+        var R = exit.orbitRadius;
+
+        car.position.x = Math.sin(a) * R;
+        car.position.z = Math.cos(a) * R;
+        car.rotation.y = a; // local +X aligns with tangent (cos a, 0, −sin a)
+
+        /* speed-shake floor grid */
+        grid.position.y = 0.01 + Math.sin(t * 40) * 0.003;
+
+        /* chase camera — behind + above */
+        if (exit.followCam) {
+          var fd = 5.8;
+          camera.position.x = car.position.x - Math.cos(a) * fd;
+          camera.position.y = 3.4 + Math.sin(a * 2) * 0.28;
+          camera.position.z = car.position.z + Math.sin(a) * fd;
+          camera.lookAt(car.position.x, 1.1, car.position.z);
+        }
+
+        /* neon trail — two offset points per frame for dual-colour ribbon */
+        exit.trailAlt = !exit.trailAlt;
+        var offX = -Math.cos(a) * 0.5 + (exit.trailAlt ? 0.45 : -0.45) * Math.sin(a);
+        var offZ =  Math.sin(a) * 0.5 + (exit.trailAlt ? 0.45 : -0.45) * Math.cos(a);
+        pushTrail(car.position.x + offX, car.position.z + offZ, exit.trailAlt);
+      }
+
+      /* ── FINAL HIGH-SPEED PASS ── */
+      if (exit.passOn && exit.passProxy) {
+        var px = exit.passStart.x + (0 - exit.passStart.x) * exit.passProxy.t;
+        var pz = exit.passStart.z + (-14 - exit.passStart.z) * exit.passProxy.t;
+        car.position.x = px;
+        car.position.z = pz;
+        /* aim nose at camera then shoot past */
+        car.rotation.y = Math.PI / 2; // faces −Z = toward camera at z≈4
+
+        /* per-frame trail burst */
+        exit.trailAlt = !exit.trailAlt;
+        pushTrail(px, pz, exit.trailAlt);
+        pushTrail(px + 0.3, pz + 0.3, !exit.trailAlt);
+      }
 
       renderer.render(scene, camera);
     }
@@ -1305,49 +1414,163 @@ document.querySelectorAll('.proj-card').forEach(card=>{
       ft.classList.add('show');
     }
 
-    /* ── Enter Portfolio — transition ─────────────────── */
+    /* ── Enter Portfolio — CINEMATIC 5-SECOND EXIT SEQUENCE ── */
     document.getElementById('btn-enter').addEventListener('click', function() {
+      if (exit.started) return;   // prevent double-click
+      exit.started = true;
+
+      /* ── Phase 0 (0 – 350ms): title out, headlights flare ── */
       var ft = document.getElementById('final-title');
-      gsap.to(ft, { opacity: 0, duration: 0.7, ease: 'power2.in' });
       ft.style.pointerEvents = 'none';
+      gsap.to(ft, { opacity: 0, duration: 0.35, ease: 'power3.in' });
 
-      /* dissolve car meshes */
+      /* Dissolve holograms — they vanish as the car "reactivates" */
+      holograms.forEach(function(h, i) {
+        h._tgt = 0;
+        gsap.to(h.material, { opacity: 0, duration: 0.4, delay: i * 0.06 });
+      });
+
+      /* Blast headlights bright — ignition */
       car.traverse(function(obj) {
-        if (obj.isMesh && obj.material) {
-          var mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-          mats.forEach(function(m) {
-            m.transparent = true;
-            gsap.to(m, { opacity: 0, duration: 1.3, ease: 'power2.in' });
-          });
+        if (obj.isPointLight) {
+          gsap.to(obj, { intensity: obj.intensity * 3, duration: 0.38, ease: 'power2.out' });
         }
       });
 
-      /* dissolve holograms */
-      holograms.forEach(function(h) {
-        gsap.to(h.material, { opacity: 0, duration: 0.9, ease: 'power2.in' });
+      /* Engine vibration micro-shake */
+      gsap.to(camera.position, {
+        y: camera.position.y + 0.12,
+        duration: 0.045, yoyo: true, repeat: 12, ease: 'none'
       });
 
-      /* camera rushes forward */
-      gsap.to(camera.position, { z: -3, duration: 1.5, ease: 'power2.in',
-        onUpdate: function() { camera.lookAt(0, 1.4, 0); }
-      });
+      /* ── Phase 1 (500ms): car rolls to orbit entry ── */
+      setTimeout(function exitPhase1() {
+        /* Tuck camera low and behind car's upcoming path */
+        gsap.to(camera.position, {
+          x: 0, y: 3.8, z: 14,
+          duration: 0.7, ease: 'power2.inOut',
+          onUpdate: function() { camera.lookAt(0, 1, 0); }
+        });
 
-      /* overlay fades to reveal portfolio */
-      gsap.to(overlay, {
-        opacity: 0, duration: 1.3, delay: 0.55,
-        onComplete: function() {
-          cancelAnimationFrame(rafId);
-          renderer.dispose();
-          holograms.forEach(function(h) {
-            if (h.material.map) h.material.map.dispose();
-            h.material.dispose();
-            h.geometry.dispose();
+        /* Car rolls forward from rest to orbit-start (0, 0, orbitRadius) */
+        gsap.to(car.position, {
+          x: 0, z: exit.orbitRadius,
+          duration: 0.75, ease: 'power2.in',
+          onUpdate: function() {
+            /* steer nose toward +Z as it accelerates */
+            var dx = 0 - car.position.x;
+            var dz = exit.orbitRadius - car.position.z;
+            car.rotation.y = Math.atan2(-dz, dx);
+          },
+          onComplete: function() {
+            /* ── Phase 2: orbit + chase cam starts ── */
+            exit.lastT      = clock.getElapsedTime();
+            exit.orbitAngle = 0;   // a=0 → car at (0,0,R) facing +X
+            exit.orbitOn    = true;
+            exit.followCam  = true;
+
+            /* Acceleration shake */
+            gsap.to(camera.position, {
+              x: 0.35, duration: 0.06, yoyo: true, repeat: 8, ease: 'none'
+            });
+          }
+        });
+      }, 500);
+
+      /* ── Phase 3 (500+750+2500 = 3750ms): orbit done → final pass ── */
+      setTimeout(function exitPhase3() {
+        exit.orbitOn   = false;
+        exit.followCam = false;
+
+        /* Camera drops low and centres, looking down the car's oncoming path */
+        gsap.to(camera.position, {
+          x: 0, y: 2.2, z: 5,
+          duration: 0.4, ease: 'power2.inOut',
+          onUpdate: function() { camera.lookAt(0, 0.8, 0); }
+        });
+
+        /* Give the car a tiny drift-pivot before the charge */
+        gsap.to(car.rotation, { y: Math.PI / 2 - 0.22, duration: 0.25, ease: 'power2.out',
+          onComplete: function() {
+            gsap.to(car.rotation, { y: Math.PI / 2, duration: 0.18, ease: 'power2.in' });
+          }
+        });
+
+        /* ── Phase 4 (3750 + 400 = 4150ms): HIGH-SPEED PASS ── */
+        setTimeout(function finalPass() {
+          exit.passStart  = { x: car.position.x, z: car.position.z };
+          exit.passProxy  = { t: 0 };
+          exit.passOn     = true;
+
+          gsap.to(exit.passProxy, {
+            t: 1,
+            duration: 0.68,
+            ease: 'power4.in',
+            onUpdate: function() {
+              /* Flash triggers at ~60% = when car crosses camera z-plane */
+              if (exit.passProxy.t > 0.58 && !exit.flashed) {
+                exit.flashed = true;
+
+                /* ── SCREEN FILL: blue-white blast ── */
+                gsap.to(flashDiv, { opacity: 1, duration: 0.10, ease: 'none',
+                  onComplete: function() {
+                    gsap.to(flashDiv, { opacity: 0, duration: 0.75, delay: 0.08 });
+                  }
+                });
+
+                /* Particle explosion — burst all velocities outward */
+                var pArr = ambPts.geometry.attributes.position.array;
+                ambPts._vel.forEach(function(v, i) {
+                  var px = pArr[i*3], pz = pArr[i*3+2];
+                  var len = Math.sqrt(px*px + pz*pz) || 1;
+                  v.x += (px / len) * 0.18;
+                  v.y += 0.06 + Math.random() * 0.08;
+                  v.z += (pz / len) * 0.18;
+                });
+
+                /* Camera shake — violent */
+                gsap.to(camera.position, {
+                  y: camera.position.y + 0.4,
+                  duration: 0.055, yoyo: true, repeat: 10, ease: 'none'
+                });
+                gsap.to(camera.position, {
+                  x: 0.5, duration: 0.06, yoyo: true, repeat: 8, ease: 'none', delay: 0.03
+                });
+              }
+            },
+            onComplete: revealPortfolio
           });
-          overlay.style.display = 'none';
-          mainContent.classList.add('visible');
-          startParticles();
-        }
-      });
+        }, 400);
+
+      }, 3750);
+
+      /* ── Phase 5: Portfolio reveal ── */
+      function revealPortfolio() {
+        exit.passOn = false;
+
+        /* Fog to black — swallows scene */
+        gsap.to(scene.fog, { far: 6, duration: 0.85, ease: 'power2.in' });
+
+        /* Overlay fades — portfolio underneath */
+        gsap.to(overlay, {
+          opacity: 0, duration: 0.95, delay: 0.25, ease: 'power2.inOut',
+          onComplete: function() {
+            cancelAnimationFrame(rafId);
+            renderer.dispose();
+            trailGeo.dispose();
+            trailPts.material.dispose();
+            holograms.forEach(function(h) {
+              if (h.material.map) h.material.map.dispose();
+              h.material.dispose();
+              h.geometry.dispose();
+            });
+            if (flashDiv.parentNode) flashDiv.parentNode.removeChild(flashDiv);
+            overlay.style.display  = 'none';
+            mainContent.classList.add('visible');
+            startParticles();
+          }
+        });
+      }
     });
 
     /* resize handler */
